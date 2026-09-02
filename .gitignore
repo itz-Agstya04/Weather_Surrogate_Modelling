@@ -1,0 +1,49 @@
+# Python virtual environments and bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test, type-checker, and notebook caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Local data products and cloud-download caches
+DATASET/
+*.zarr/
+*.zarr.zip
+*.nc
+*.nc4
+*.h5
+*.hdf5
+
+# Trained weights, checkpoints, and experiment outputs
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+results/
+wandb/
+lightning_logs/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
