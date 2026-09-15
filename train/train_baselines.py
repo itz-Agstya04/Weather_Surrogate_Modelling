@@ -30,94 +30,116 @@ from data.pino_data_pipeline import (
     get_rollout_loader,
     SURFACE_VARS,
     UPPER_AIR_VAR,
-    TARGET_LEVELS
+    UPPER_AIR_TEMPERATURE_VAR,
+    TARGET_LEVELS,
+    CHANNEL_NAMES as STATE_CHANNEL_NAMES
 )
 
 
+def save_checkpoint(state_dict: dict, name: str, directory: str = "DATASET/checkpoints") -> str:
+    """Persist a CPU state dict and return its path."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{name}.pt")
+    torch.save(state_dict, path)
+    return path
+
+
+def load_checkpoint(model: nn.Module, path: str, device: torch.device = None) -> nn.Module:
+    """Load a saved state dict into ``model`` for inference or evaluation."""
+    try:
+        state_dict = torch.load(path, map_location=device or torch.device("cpu"), weights_only=True)
+    except TypeError:  # PyTorch < 2.0 compatibility
+        state_dict = torch.load(path, map_location=device or torch.device("cpu"))
+    model.load_state_dict(state_dict)
+    return model
+
+
 # =====================================================================
-# 1. DENSE 3D FOURIER NEURAL OPERATOR (BASELINE 1 & 2 ARCHITECTURE)
+# 1. 2D FOURIER NEURAL OPERATOR (BASELINE ARCHITECTURE)
 # =====================================================================
 
-class SpectralConv3d(nn.Module):
+class SpectralConv2d(nn.Module):
     """
-    3D Spectral Convolution Layer over (Depth=8, Latitude=15, Longitude=17).
+    2D spectral convolution over the latitude/longitude grid.
     """
-    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int, modes3: int):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.modes1 = modes1  # Depth modes (max 4)
-        self.modes2 = modes2  # Lat modes (max 8)
-        self.modes3 = modes3  # Lon modes (max 9)
+        self.modes1 = modes1
+        self.modes2 = modes2
 
         scale = (1.0 / (in_channels * out_channels))
-        self.weights1 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, modes3, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, modes3, dtype=torch.cfloat))
-        self.weights3 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, modes3, dtype=torch.cfloat))
-        self.weights4 = nn.Parameter(scale * torch.rand(in_channels, out_channels, modes1, modes2, modes3, dtype=torch.cfloat))
+        shape = (in_channels, out_channels, modes1, modes2)
+        self.weights1 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+        self.weights2 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+        self.weights3 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+        self.weights4 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
 
-    def compl_mul3d(self, input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        # (batch, in_channel, d, h, w), (in_channel, out_channel, d, h, w) -> (batch, out_channel, d, h, w)
-        return torch.einsum("bixyz,ioxyz->boxyz", input_tensor, weights)
+    def compl_mul2d(self, input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("bixy,ioxy->boxy", input_tensor, weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batchsize = x.shape[0]
         dtype = x.dtype
-        # Cast to float32 for cuFFT precision support on non-power-of-2 spatial grids [8, 15, 17]
-        x_ft = torch.fft.rfftn(x.float(), dim=(-3, -2, -1))
+        height, width = x.shape[-2:]
+        x_ft = torch.fft.rfft2(x.float(), dim=(-2, -1))
 
         out_ft = torch.zeros(
-            batchsize, self.out_channels, x.size(-3), x.size(-2), x.size(-1) // 2 + 1,
+            batchsize, self.out_channels, height, width // 2 + 1,
             dtype=torch.cfloat, device=x.device
         )
 
-        m1, m2, m3 = self.modes1, self.modes2, self.modes3
+        m1 = min(self.modes1, height // 2 + 1)
+        m2 = min(self.modes2, width // 2 + 1)
 
-        out_ft[:, :, :m1, :m2, :m3] = self.compl_mul3d(x_ft[:, :, :m1, :m2, :m3], self.weights1)
-        out_ft[:, :, -m1:, :m2, :m3] = self.compl_mul3d(x_ft[:, :, -m1:, :m2, :m3], self.weights2)
-        out_ft[:, :, :m1, -m2:, :m3] = self.compl_mul3d(x_ft[:, :, :m1, -m2:, :m3], self.weights3)
-        out_ft[:, :, -m1:, -m2:, :m3] = self.compl_mul3d(x_ft[:, :, -m1:, -m2:, :m3], self.weights4)
+        out_ft[:, :, :m1, :m2] = self.compl_mul2d(x_ft[:, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
+        out_ft[:, :, -m1:, :m2] = self.compl_mul2d(x_ft[:, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
+        out_ft[:, :, :m1, -m2:] = self.compl_mul2d(x_ft[:, :, :m1, -m2:], self.weights3[:, :, :m1, :m2])
+        out_ft[:, :, -m1:, -m2:] = self.compl_mul2d(x_ft[:, :, -m1:, -m2:], self.weights4[:, :, :m1, :m2])
 
-        x_out = torch.fft.irfftn(out_ft, s=(x.size(-3), x.size(-2), x.size(-1)))
+        x_out = torch.fft.irfft2(out_ft, s=(height, width))
         return x_out.to(dtype=dtype)
 
 
-class Dense3DFNO(nn.Module):
+class CoordinateFNO2d(nn.Module):
     """
-    Dense 3D FNO Model.
-    Reshapes 8-channel 2D state (B, 8, Lat, Lon) into 3D volume (B, 1, 8, Lat, Lon),
-    applies 3D spectral convolution blocks, and projects back to (B, 8, Lat, Lon).
+    2D FNO with four fixed geographic coordinate channels.  The physical
+    state remains (B, 13, latitude, longitude); coordinates are auxiliary input.
     """
-    def __init__(self, in_dim: int = 8, out_dim: int = 8, width: int = 32, modes1: int = 4, modes2: int = 6, modes3: int = 6):
+    def __init__(self, in_dim: int = len(STATE_CHANNEL_NAMES), out_dim: int = len(STATE_CHANNEL_NAMES), width: int = 32, modes1: int = 8, modes2: int = 6):
         super().__init__()
-        self.in_dim = in_dim
+        self.in_dim = in_dim + 4
         self.out_dim = out_dim
         self.width = width
 
-        # Uplift: 1 channel 3D volume -> width channels
-        self.p = nn.Conv3d(1, width, kernel_size=1)
+        self.p = nn.Conv2d(self.in_dim, width, kernel_size=1)
 
-        # 4 Spectral 3D Convolution Blocks
-        self.conv0 = SpectralConv3d(width, width, modes1, modes2, modes3)
-        self.conv1 = SpectralConv3d(width, width, modes1, modes2, modes3)
-        self.conv2 = SpectralConv3d(width, width, modes1, modes2, modes3)
-        self.conv3 = SpectralConv3d(width, width, modes1, modes2, modes3)
+        self.conv0 = SpectralConv2d(width, width, modes1, modes2)
+        self.conv1 = SpectralConv2d(width, width, modes1, modes2)
+        self.conv2 = SpectralConv2d(width, width, modes1, modes2)
+        self.conv3 = SpectralConv2d(width, width, modes1, modes2)
 
-        self.w0 = nn.Conv3d(width, width, kernel_size=1)
-        self.w1 = nn.Conv3d(width, width, kernel_size=1)
-        self.w2 = nn.Conv3d(width, width, kernel_size=1)
-        self.w3 = nn.Conv3d(width, width, kernel_size=1)
+        self.w0 = nn.Conv2d(width, width, kernel_size=1)
+        self.w1 = nn.Conv2d(width, width, kernel_size=1)
+        self.w2 = nn.Conv2d(width, width, kernel_size=1)
+        self.w3 = nn.Conv2d(width, width, kernel_size=1)
 
-        # Projection back to 1 channel 3D volume
-        self.q1 = nn.Conv3d(width, width // 2, kernel_size=1)
-        self.q2 = nn.Conv3d(width // 2, 1, kernel_size=1)
+        self.q1 = nn.Conv2d(width, width // 2, kernel_size=1)
+        self.q2 = nn.Conv2d(width // 2, out_dim, kernel_size=1)
+
+    @staticmethod
+    def coordinates(height: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        lat = torch.linspace(33.5, 30.0, height, device=device, dtype=dtype) * (np.pi / 180.0)
+        lon = torch.linspace(75.5, 79.5, width, device=device, dtype=dtype) * (np.pi / 180.0)
+        lat_grid, lon_grid = torch.meshgrid(lat, lon, indexing="ij")
+        return torch.stack((torch.sin(lat_grid), torch.cos(lat_grid),
+                            torch.sin(lon_grid), torch.cos(lon_grid)), dim=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C=8, H=15, W=17)
-        B, C, H, W = x.shape
-        x_3d = x.unsqueeze(1)  # (B, 1, D=8, H=15, W=17)
-
-        x_feat = self.p(x_3d)
+        _, _, height, width = x.shape
+        coords = self.coordinates(height, width, x.device, x.dtype).unsqueeze(0).expand(x.size(0), -1, -1, -1)
+        x_feat = self.p(torch.cat((x, coords), dim=1))
 
         # Block 0
         x1 = self.conv0(x_feat) + self.w0(x_feat)
@@ -136,11 +158,7 @@ class Dense3DFNO(nn.Module):
         x_feat = F.gelu(x4)
 
         # Output projection
-        out_3d = self.q1(x_feat)
-        out_3d = F.gelu(out_3d)
-        out_3d = self.q2(out_3d)  # (B, 1, D=8, H=15, W=17)
-
-        out = out_3d.squeeze(1)  # (B, 8, H=15, W=17)
+        out = self.q2(F.gelu(self.q1(x_feat)))
         return out
 
 
@@ -148,48 +166,76 @@ class Dense3DFNO(nn.Module):
 # 2. STEP 3: PHYSICS LOSS TERMS FOR BASELINE 2 (STANDARD PINO)
 # =====================================================================
 
-def compute_divergence_loss(pred_state: torch.Tensor) -> torch.Tensor:
+def compute_divergence_loss(pred_state: torch.Tensor, normalizer: PINONormalizer = None) -> torch.Tensor:
     """
     Mass / continuity conservation loss: penalizes horizontal wind divergence (10m_u, 10m_v).
-    pred_state: (B, C=8, H=15, W=17)
+    pred_state: (B, C=13, H=15, W=17)
     10m_u is index 1, 10m_v is index 2.
 
     NOTE: We use dimensionless grid-unit differences (no physical dx/dy scaling).
     Physical scaling by 1/(2*25000) makes gradients ~5e-8, causing div²~5e-16 -> numerically zero.
     Dimensionless differences are O(0.1) in normalized space, giving a useful gradient signal.
     """
-    u = pred_state[:, 1, :, :]  # (B, H, W)
-    v = pred_state[:, 2, :, :]  # (B, H, W)
+    if normalizer is not None:
+        u = pred_state[:, 1].float() * float(normalizer.channel_stds[1]) + float(normalizer.channel_means[1])
+        v = pred_state[:, 2].float() * float(normalizer.channel_stds[2]) + float(normalizer.channel_means[2])
+    else:
+        u, v = pred_state[:, 1].float(), pred_state[:, 2].float()
+
+    height, width = u.shape[-2:]
+    lat = torch.linspace(33.5, 30.0, height, device=pred_state.device, dtype=torch.float32)
+    dlat = torch.abs(lat[1] - lat[0]) * (np.pi / 180.0)
+    dlon = (4.0 / (width - 1)) * (np.pi / 180.0)
+    earth_radius = 6_371_000.0
+    dy = earth_radius * dlat
+    dx = earth_radius * torch.cos(lat * (np.pi / 180.0)) * dlon
 
     # Central finite differences in grid-unit space
-    du_dx = (u[:, :, 2:] - u[:, :, :-2]) / 2.0  # (B, H, W-2)
-    dv_dy = (v[:, 2:, :] - v[:, :-2, :]) / 2.0  # (B, H-2, W)
+    du_dx = (u[:, :, 2:] - u[:, :, :-2]) / (2.0 * dx.view(1, -1, 1))
+    dv_dy = (v[:, 2:, :] - v[:, :-2, :]) / (2.0 * dy)
 
     # Align spatial dimensions (H-2, W-2)
     du_dx_crop = du_dx[:, 1:-1, :]
     dv_dy_crop = dv_dy[:, :, 1:-1]
 
     div = du_dx_crop + dv_dy_crop
-    return torch.mean(div ** 2)
+    # Divergence is in s^-1. Normalize by a fixed characteristic value so
+    # the loss is numerically trainable without changing the physical units
+    # of the residual itself.
+    return torch.mean((div / 1e-5) ** 2)
 
 
-def compute_hydrostatic_loss(pred_state: torch.Tensor) -> torch.Tensor:
+def compute_hydrostatic_loss(
+    pred_state: torch.Tensor,
+    normalizer: PINONormalizer = None,
+) -> torch.Tensor:
     """
     Hydrostatic balance loss: penalizes geopotential inversions across pressure levels.
     Geopotential levels [1000, 850, 700, 500, 300] hPa are indices 3, 4, 5, 6, 7.
 
-    NOTE: pred_state is in normalized space. Since normalization is per-level with
-    different means/stds, the ordering of normalized values is not monotone by design.
-    We therefore penalize only inconsistency in the *sign* of differences: in raw space,
-    phi increases with altitude (lower pressure), so we soft-penalize negative differences
-    in a relative sense (diff < -1 in normalized units signals a clear inversion).
+    pred_state is normalized by the data pipeline. If a normalizer is supplied,
+    geopotential is converted back to physical units before checking that it
+    increases as pressure decreases.
     """
-    phi = pred_state[:, 3:8, :, :]         # (B, 5, H, W) — normalized geopotential levels
-    diffs = phi[:, 1:, :, :] - phi[:, :-1, :, :]  # (B, 4, H, W)
+    # Keep this calculation in float32: raw 300 hPa geopotential is ~90,000,
+    # which can overflow float16 under CUDA autocast.
+    phi = pred_state[:, 3:8, :, :].float()  # (B, 5, H, W)
+    temperature = pred_state[:, 8:13, :, :].float()
+    if normalizer is not None:
+        phi_means = torch.as_tensor(normalizer.channel_means[3:8], dtype=torch.float32, device=pred_state.device)
+        phi_stds = torch.as_tensor(normalizer.channel_stds[3:8], dtype=torch.float32, device=pred_state.device)
+        temp_means = torch.as_tensor(normalizer.channel_means[8:13], dtype=torch.float32, device=pred_state.device)
+        temp_stds = torch.as_tensor(normalizer.channel_stds[8:13], dtype=torch.float32, device=pred_state.device)
+        phi = phi.float() * phi_stds + phi_means
+        temperature = temperature * temp_stds + temp_means
 
-    # Only penalize clear inversions (diffs < -1.0 in normalized units)
-    inversion_penalty = torch.relu(-1.0 - diffs)
-    return torch.mean(inversion_penalty ** 2)
+    pressure = torch.tensor([1000, 850, 700, 500, 300], dtype=torch.float32, device=pred_state.device) * 100.0
+    dp = pressure[1:] - pressure[:-1]
+    phi_dp = (phi[:, 1:] - phi[:, :-1]) / dp.view(1, -1, 1, 1)
+    p_mid = ((pressure[1:] + pressure[:-1]) / 2.0).view(1, -1, 1, 1)
+    temp_mid = (temperature[:, 1:] + temperature[:, :-1]) / 2.0
+    expected = -287.05 * temp_mid / p_mid
+    return torch.mean((phi_dp - expected).square())
 
 
 # =====================================================================
@@ -204,13 +250,15 @@ def train_one_epoch(
     use_physics_loss: bool = False,
     lambda_div: float = 0.01,
     lambda_hydro: float = 0.01,
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0,
+    normalizer: PINONormalizer = None,
 ):
     model.train()
     total_loss = 0.0
     total_data_loss = 0.0
     total_div_loss = 0.0
     total_hydro_loss = 0.0
+    total_physics_grad_norm = 0.0
 
     use_cuda = device.type == 'cuda'
 
@@ -223,13 +271,24 @@ def train_one_epoch(
             data_loss = F.mse_loss(pred, tgt)
 
             if use_physics_loss:
-                div_loss = compute_divergence_loss(pred)
-                hydro_loss = compute_hydrostatic_loss(pred)
+                div_loss = compute_divergence_loss(pred, normalizer=normalizer)
+                hydro_loss = compute_hydrostatic_loss(pred, normalizer=normalizer)
                 loss = data_loss + lambda_div * div_loss + lambda_hydro * hydro_loss
             else:
                 div_loss = torch.tensor(0.0, device=device)
                 hydro_loss = torch.tensor(0.0, device=device)
                 loss = data_loss
+
+        if use_physics_loss:
+            physics_term = lambda_div * div_loss + lambda_hydro * hydro_loss
+            physics_grads = torch.autograd.grad(
+                physics_term, tuple(model.parameters()), retain_graph=True, allow_unused=True
+            )
+            physics_grad_norm = torch.sqrt(sum(
+                grad.detach().float().square().sum() for grad in physics_grads if grad is not None
+            )).item()
+        else:
+            physics_grad_norm = 0.0
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -239,9 +298,11 @@ def train_one_epoch(
         total_data_loss += data_loss.item() * inp.size(0)
         total_div_loss += div_loss.item() * inp.size(0)
         total_hydro_loss += hydro_loss.item() * inp.size(0)
+        total_physics_grad_norm += physics_grad_norm * inp.size(0)
 
     n = len(loader.dataset)
-    return total_loss / n, total_data_loss / n, total_div_loss / n, total_hydro_loss / n
+    return (total_loss / n, total_data_loss / n, total_div_loss / n,
+            total_hydro_loss / n, total_physics_grad_norm / n)
 
 
 @torch.no_grad()
@@ -251,7 +312,8 @@ def validate(
     device: torch.device,
     use_physics_loss: bool = False,
     lambda_div: float = 0.01,
-    lambda_hydro: float = 0.01
+    lambda_hydro: float = 0.01,
+    normalizer: PINONormalizer = None,
 ):
     model.eval()
     total_loss = 0.0
@@ -266,8 +328,8 @@ def validate(
             data_loss = F.mse_loss(pred, tgt)
 
             if use_physics_loss:
-                div_loss = compute_divergence_loss(pred)
-                hydro_loss = compute_hydrostatic_loss(pred)
+                div_loss = compute_divergence_loss(pred, normalizer=normalizer)
+                hydro_loss = compute_hydrostatic_loss(pred, normalizer=normalizer)
                 loss = data_loss + lambda_div * div_loss + lambda_hydro * hydro_loss
             else:
                 loss = data_loss
@@ -300,7 +362,7 @@ def fine_tune_rollout(
         n_samples = 0
 
         for seq_batch in rollout_loader:
-            # seq_batch shape: (B, T, C=8, Lat=15, Lon=17)
+            # seq_batch shape: (B, T, C=13, Lat, Lon)
             seq_batch = seq_batch.to(device)
             B, T, C, H, W = seq_batch.shape
 
@@ -333,89 +395,114 @@ def fine_tune_rollout(
 # 5. STEP 6: EVALUATION METRICS (LAT-WEIGHTED RMSE & ACC)
 # =====================================================================
 
+METRIC_NAMES = (
+    ['T2m', 'U10', 'V10']
+    + [f'Z{level}' for level in TARGET_LEVELS]
+    + [f'T{level}' for level in TARGET_LEVELS]
+)
+
+
+def calculate_metrics(preds_raw: torch.Tensor, tgts_raw: torch.Tensor,
+                      normalizer: PINONormalizer, lats: np.ndarray,
+                      climatology: torch.Tensor = None) -> dict:
+    """Return per-channel latitude-weighted RMSE and anomaly ACC."""
+    weights = torch.from_numpy(np.cos(np.radians(lats)).astype(np.float32)).reshape(1, 1, -1, 1)
+    sq_err = (preds_raw - tgts_raw) ** 2
+    denom = weights.sum() * preds_raw.size(0) * preds_raw.size(3)
+    rmse = torch.sqrt((sq_err * weights).sum(dim=(0, 2, 3)) / denom)
+
+    stds = torch.from_numpy(normalizer.channel_stds.reshape(1, -1, 1, 1))
+    nrmse = rmse / stds.flatten()
+
+    # ACC uses the training climatology when supplied. This avoids using test
+    # targets to define the anomaly reference.
+    if climatology is None:
+        climatology = (tgts_raw * weights).sum(dim=(0, 2, 3)) / denom
+    pred_anom = preds_raw - climatology.reshape(1, -1, 1, 1)
+    tgt_anom = tgts_raw - climatology.reshape(1, -1, 1, 1)
+    cov = (weights * pred_anom * tgt_anom).sum(dim=(0, 2, 3))
+    pred_var = (weights * pred_anom.square()).sum(dim=(0, 2, 3))
+    tgt_var = (weights * tgt_anom.square()).sum(dim=(0, 2, 3))
+    acc = cov / (torch.sqrt(pred_var * tgt_var) + 1e-8)
+
+    return {
+        'rmse': {name: float(value) for name, value in zip(METRIC_NAMES, rmse)},
+        'nrmse': {name: float(value) for name, value in zip(METRIC_NAMES, nrmse)},
+        'acc': {name: float(value) for name, value in zip(METRIC_NAMES, acc)},
+        'aggregate_rmse': float(rmse.mean()),
+        'aggregate_nrmse': float(nrmse.mean()),
+        'aggregate_acc': float(acc.mean()),
+    }
+
+
 @torch.no_grad()
-def evaluate_model_on_test(
-    model: nn.Module,
-    test_loader: DataLoader,
-    normalizer: PINONormalizer,
-    device: torch.device,
-    lats: np.ndarray = np.linspace(33.5, 30.0, 15)
-):
+def evaluate_model_on_test(model: nn.Module, test_loader: DataLoader,
+                           normalizer: PINONormalizer, device: torch.device,
+                           lats: np.ndarray = np.linspace(33.5, 30.0, 15),
+                           climatology: torch.Tensor = None):
     model.eval()
     use_cuda = device.type == 'cuda'
-
-    # Compute latitude weights cos(lat * pi / 180)
-    w_lat = np.cos(np.radians(lats)).astype(np.float32)
-    w_lat = torch.from_numpy(w_lat).reshape(1, 1, -1, 1).to(device)  # (1, 1, Lat, 1)
-
-    all_preds_raw = []
-    all_tgts_raw = []
-
-    # Reset peak GPU memory tracking
     if use_cuda:
         torch.cuda.reset_peak_memory_stats(device)
-
-    t_start = time.perf_counter()
-    n_batches = 0
-
+    predictions, targets = [], []
+    start = time.perf_counter()
+    batches = 0
     for inp, tgt in test_loader:
         inp, tgt = inp.to(device), tgt.to(device)
         with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
             pred = model(inp)
+        predictions.append(normalizer.denormalize(pred.float()).cpu())
+        targets.append(normalizer.denormalize(tgt.float()).cpu())
+        batches += 1
+    metrics = calculate_metrics(torch.cat(predictions), torch.cat(targets), normalizer, lats, climatology)
+    metrics['peak_gpu_mem_mb'] = (torch.cuda.max_memory_allocated(device) / 1e6) if use_cuda else 0.0
+    metrics['inference_latency_ms'] = ((time.perf_counter() - start) / max(1, batches)) * 1000.0
+    return metrics
 
-        # Denormalize predictions and targets to raw physical units
-        # Cast to float32 first: autocast produces float16 tensors; geopotential std * values
-        # can exceed float16 max (65504) causing overflow -> inf RMSE
-        pred_raw = normalizer.denormalize(pred.float())
-        tgt_raw = normalizer.denormalize(tgt.float())
 
-        all_preds_raw.append(pred_raw.cpu())
-        all_tgts_raw.append(tgt_raw.cpu())
-        n_batches += 1
+@torch.no_grad()
+def evaluate_persistence_on_test(test_loader: DataLoader, normalizer: PINONormalizer,
+                                 lats: np.ndarray = np.linspace(33.5, 30.0, 15),
+                                 climatology: torch.Tensor = None):
+    predictions, targets = [], []
+    for inp, tgt in test_loader:
+        predictions.append(normalizer.denormalize(inp.float()).cpu())
+        targets.append(normalizer.denormalize(tgt.float()).cpu())
+    metrics = calculate_metrics(torch.cat(predictions), torch.cat(targets), normalizer, lats, climatology)
+    metrics['peak_gpu_mem_mb'] = 0.0
+    metrics['inference_latency_ms'] = 0.0
+    return metrics
 
-    t_end = time.perf_counter()
-    inference_latency_ms = ((t_end - t_start) / max(1, n_batches)) * 1000.0
 
-    peak_gpu_mem_mb = (torch.cuda.max_memory_allocated(device) / 1e6) if use_cuda else 0.0
-
-    preds_cat = torch.cat(all_preds_raw, dim=0)  # (N, 8, 15, 17) in raw units
-    tgts_cat = torch.cat(all_tgts_raw, dim=0)
-
-    w_lat_cpu = w_lat.cpu()
-
-    # 1. Latitude-Weighted RMSE in raw units
-    sq_err = (preds_cat - tgts_cat) ** 2  # (N, 8, 15, 17)
-    weighted_sq_err = sq_err * w_lat_cpu
-    lat_rmse_raw = torch.sqrt(
-        torch.sum(weighted_sq_err) / (torch.sum(w_lat_cpu) * preds_cat.size(0) * preds_cat.size(1) * preds_cat.size(3))
-    ).item()
-
-    # 1b. Normalized RMSE: divide each channel's MSE by its train-split std^2
-    channel_stds = torch.from_numpy(normalizer.channel_stds.reshape(1, -1, 1, 1))  # (1, 8, 1, 1)
-    sq_err_norm = sq_err / (channel_stds ** 2 + 1e-8)
-    weighted_sq_err_norm = sq_err_norm * w_lat_cpu
-    lat_rmse_norm = torch.sqrt(
-        torch.sum(weighted_sq_err_norm) / (torch.sum(w_lat_cpu) * preds_cat.size(0) * preds_cat.size(1) * preds_cat.size(3))
-    ).item()
-
-    # 2. Latitude-Weighted ACC (Anomaly Correlation)
-    tgt_mean = torch.mean(tgts_cat, dim=0, keepdim=True)
-    pred_ano = preds_cat - tgt_mean
-    tgt_ano = tgts_cat - tgt_mean
-
-    cov = torch.sum(w_lat_cpu * pred_ano * tgt_ano)
-    var_pred = torch.sum(w_lat_cpu * (pred_ano ** 2))
-    var_tgt = torch.sum(w_lat_cpu * (tgt_ano ** 2))
-
-    lat_acc = (cov / (torch.sqrt(var_pred * var_tgt) + 1e-8)).item()
-
-    return {
-        'lat_weighted_rmse': lat_rmse_raw,
-        'lat_weighted_rmse_norm': lat_rmse_norm,
-        'lat_weighted_acc': lat_acc,
-        'peak_gpu_mem_mb': peak_gpu_mem_mb,
-        'inference_latency_ms': inference_latency_ms
-    }
+@torch.no_grad()
+def evaluate_rollout_horizons(model: nn.Module, rollout_loader: DataLoader,
+                              normalizer: PINONormalizer, device: torch.device,
+                              max_horizon: int = 12,
+                              lats: np.ndarray = np.linspace(33.5, 30.0, 15),
+                              climatology: torch.Tensor = None):
+    model.eval()
+    model_predictions = [[] for _ in range(max_horizon)]
+    persistence_predictions = [[] for _ in range(max_horizon)]
+    targets = [[] for _ in range(max_horizon)]
+    for sequence in rollout_loader:
+        sequence = sequence.to(device)
+        current = sequence[:, 0]
+        initial = current
+        for horizon in range(max_horizon):
+            target = sequence[:, horizon + 1]
+            with torch.amp.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+                current = model(current)
+            model_predictions[horizon].append(normalizer.denormalize(current.float()).cpu())
+            persistence_predictions[horizon].append(normalizer.denormalize(initial.float()).cpu())
+            targets[horizon].append(normalizer.denormalize(target.float()).cpu())
+    output = {}
+    for horizon in range(max_horizon):
+        target = torch.cat(targets[horizon])
+        output[f'{(horizon + 1) * 6}h'] = {
+            'FNO': calculate_metrics(torch.cat(model_predictions[horizon]), target, normalizer, lats, climatology),
+            'Persistence': calculate_metrics(torch.cat(persistence_predictions[horizon]), target, normalizer, lats, climatology),
+        }
+    return output
 
 
 # =====================================================================
@@ -445,21 +532,27 @@ def run_baseline_experiments():
     # Fine-tune only on train windows.  Validation remains untouched for
     # early stopping and model selection.
     train_rollout_loader = get_rollout_loader(train_zarr, normalizer, sequence_length=4, batch_size=8, shuffle=True)
+    test_rollout_loader = get_rollout_loader(test_zarr, normalizer, sequence_length=13, batch_size=8, shuffle=False)
+    training_climatology = normalizer.denormalize(train_loader.dataset.data.float()).mean(dim=0)
 
     results_summary = {}
+
+    print("\n--- Persistence Baseline (1-step) ---", flush=True)
+    persistence_metrics = evaluate_persistence_on_test(test_loader, normalizer, climatology=training_climatology)
+    results_summary['Persistence'] = persistence_metrics
 
     epochs = 30
     patience = 6          # early stopping patience
     max_grad_norm = 1.0   # gradient clipping
 
     # -----------------------------------------------------------------
-    # BASELINE 1: DENSE 3D FNO (DATA LOSS ONLY)
+    # BASELINE 1: 2D FNO WITH GEOGRAPHIC COORDINATES (DATA LOSS ONLY)
     # -----------------------------------------------------------------
     print("\n-------------------------------------------------------", flush=True)
-    print("      STEP 2: TRAINING BASELINE 1 (DENSE 3D FNO)      ", flush=True)
+    print("      STEP 2: TRAINING BASELINE 1 (2D COORDINATE FNO)   ", flush=True)
     print("-------------------------------------------------------", flush=True)
 
-    b1_model = Dense3DFNO(in_dim=8, out_dim=8, width=32).to(device)
+    b1_model = CoordinateFNO2d(in_dim=len(STATE_CHANNEL_NAMES), out_dim=len(STATE_CHANNEL_NAMES), width=32).to(device)
     b1_optimizer = torch.optim.AdamW(b1_model.parameters(), lr=3e-4, weight_decay=1e-4)
     b1_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(b1_optimizer, T_max=epochs, eta_min=1e-5)
 
@@ -470,7 +563,7 @@ def run_baseline_experiments():
     b1_best_state = None
 
     for epoch in range(1, epochs + 1):
-        tr_loss, tr_data, _, _ = train_one_epoch(
+        tr_loss, tr_data, _, _, _ = train_one_epoch(
             b1_model, train_loader, b1_optimizer, device,
             use_physics_loss=False, max_grad_norm=max_grad_norm
         )
@@ -500,6 +593,7 @@ def run_baseline_experiments():
     if b1_best_state is not None:
         b1_model.load_state_dict({k: v.to(device) for k, v in b1_best_state.items()})
         print(f"  [Restored] Best B1 weights (val={b1_best_val:.5f})", flush=True)
+        print(f"  [Checkpoint] {save_checkpoint(b1_best_state, 'fno')}", flush=True)
 
     # Rollout Fine-Tuning for Baseline 1
     print("\n--- Step 5: Rollout Fine-Tuning Baseline 1 ---", flush=True)
@@ -508,9 +602,9 @@ def run_baseline_experiments():
 
     # Evaluate Baseline 1 on Test Split
     print("\n--- Step 6: Evaluating Baseline 1 on Test Split ---", flush=True)
-    b1_metrics = evaluate_model_on_test(b1_model, test_loader, normalizer, device)
-    results_summary['Baseline 1 (Dense 3D FNO)'] = b1_metrics
-    print(f"  [OK] B1 Test RMSE: {b1_metrics['lat_weighted_rmse']:.2f} | Norm-RMSE: {b1_metrics['lat_weighted_rmse_norm']:.4f} | ACC: {b1_metrics['lat_weighted_acc']:.4f} | Mem: {b1_metrics['peak_gpu_mem_mb']:.1f}MB | Lat: {b1_metrics['inference_latency_ms']:.2f}ms")
+    b1_metrics = evaluate_model_on_test(b1_model, test_loader, normalizer, device, climatology=training_climatology)
+    results_summary['FNO (2D + coordinates)'] = b1_metrics
+    print(f"  [OK] B1 aggregate nRMSE: {b1_metrics['aggregate_nrmse']:.4f} | aggregate ACC: {b1_metrics['aggregate_acc']:.4f}")
 
     # -----------------------------------------------------------------
     # BASELINE 2: STANDARD PINO (WITH SOFT PHYSICS CONSTRAINTS)
@@ -519,7 +613,7 @@ def run_baseline_experiments():
     print("      STEP 4: TRAINING BASELINE 2 (STANDARD PINO)     ", flush=True)
     print("-------------------------------------------------------", flush=True)
 
-    b2_model = Dense3DFNO(in_dim=8, out_dim=8, width=32).to(device)
+    b2_model = CoordinateFNO2d(in_dim=len(STATE_CHANNEL_NAMES), out_dim=len(STATE_CHANNEL_NAMES), width=32).to(device)
     b2_optimizer = torch.optim.AdamW(b2_model.parameters(), lr=3e-4, weight_decay=1e-4)
     b2_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(b2_optimizer, T_max=epochs, eta_min=1e-5)
 
@@ -530,12 +624,15 @@ def run_baseline_experiments():
     b2_best_state = None
 
     for epoch in range(1, epochs + 1):
-        tr_loss, tr_data, tr_div, tr_hydro = train_one_epoch(
+        tr_loss, tr_data, tr_div, tr_hydro, tr_physics_grad = train_one_epoch(
             b2_model, train_loader, b2_optimizer, device,
             use_physics_loss=True, lambda_div=0.01, lambda_hydro=0.1,
-            max_grad_norm=max_grad_norm
+            max_grad_norm=max_grad_norm, normalizer=normalizer
         )
-        vl_loss, vl_data = validate(b2_model, val_loader, device, use_physics_loss=True, lambda_div=0.01, lambda_hydro=0.1)
+        vl_loss, vl_data = validate(
+            b2_model, val_loader, device, use_physics_loss=True,
+            lambda_div=0.01, lambda_hydro=0.1, normalizer=normalizer
+        )
         b2_scheduler.step()
 
         b2_train_losses.append(tr_loss)
@@ -550,7 +647,7 @@ def run_baseline_experiments():
             b2_no_improve += 1
 
         marker = " *" if improved else ""
-        print(f"  B2 Epoch {epoch:2d}/{epochs} -> Total: {tr_loss:.5f} (Data: {tr_data:.5f} Div: {tr_div:.7f} Hydro: {tr_hydro:.7f}) | Val: {vl_loss:.5f}{marker}", flush=True)
+        print(f"  B2 Epoch {epoch:2d}/{epochs} -> Total: {tr_loss:.5f} (Data: {tr_data:.5f} Div: {tr_div:.7f} Hydro: {tr_hydro:.7f} PhysicsGrad: {tr_physics_grad:.3e}) | Val: {vl_loss:.5f}{marker}", flush=True)
         assert not np.isnan(tr_loss) and not np.isnan(vl_loss), "Baseline 2 Loss is NaN!"
 
         if b2_no_improve >= patience:
@@ -561,6 +658,7 @@ def run_baseline_experiments():
     if b2_best_state is not None:
         b2_model.load_state_dict({k: v.to(device) for k, v in b2_best_state.items()})
         print(f"  [Restored] Best B2 weights (val={b2_best_val:.5f})", flush=True)
+        print(f"  [Checkpoint] {save_checkpoint(b2_best_state, 'pino')}", flush=True)
 
     # Rollout Fine-Tuning for Baseline 2
     print("\n--- Step 5: Rollout Fine-Tuning Baseline 2 ---", flush=True)
@@ -569,9 +667,25 @@ def run_baseline_experiments():
 
     # Evaluate Baseline 2 on Test Split
     print("\n--- Step 6: Evaluating Baseline 2 on Test Split ---", flush=True)
-    b2_metrics = evaluate_model_on_test(b2_model, test_loader, normalizer, device)
-    results_summary['Baseline 2 (Standard PINO)'] = b2_metrics
-    print(f"  [OK] B2 Test RMSE: {b2_metrics['lat_weighted_rmse']:.2f} | Norm-RMSE: {b2_metrics['lat_weighted_rmse_norm']:.4f} | ACC: {b2_metrics['lat_weighted_acc']:.4f} | Mem: {b2_metrics['peak_gpu_mem_mb']:.1f}MB | Lat: {b2_metrics['inference_latency_ms']:.2f}ms")
+    b2_metrics = evaluate_model_on_test(b2_model, test_loader, normalizer, device, climatology=training_climatology)
+    results_summary['PINO (provisional physics)'] = b2_metrics
+    print(f"  [OK] B2 aggregate nRMSE: {b2_metrics['aggregate_nrmse']:.4f} | aggregate ACC: {b2_metrics['aggregate_acc']:.4f}")
+
+    print("\n--- 6h to 72h Rollout Benchmark ---", flush=True)
+    rollout_results = {
+        'FNO (2D + coordinates)': evaluate_rollout_horizons(
+            b1_model, test_rollout_loader, normalizer, device, climatology=training_climatology
+        ),
+        'PINO (provisional physics)': evaluate_rollout_horizons(
+            b2_model, test_rollout_loader, normalizer, device, climatology=training_climatology
+        ),
+    }
+    results_summary['rollout_benchmark'] = rollout_results
+    print(f"{'Model':<28s} | {'Horizon':>7s} | {'Agg nRMSE':>10s} | {'Agg ACC':>9s}")
+    print("-" * 64)
+    for model_name, horizons in rollout_results.items():
+        for horizon, metrics in horizons.items():
+            print(f"{model_name:<28s} | {horizon:>7s} | {metrics['aggregate_nrmse']:>10.4f} | {metrics['aggregate_acc']:>9.4f}")
 
     # Save Results Table JSON
     results_file = os.path.join("DATASET", "baseline_results.json")
@@ -581,13 +695,12 @@ def run_baseline_experiments():
     print("\n=======================================================", flush=True)
     print("            FINAL BASELINES COMPARISON TABLE           ", flush=True)
     print("=======================================================", flush=True)
-    print(f"{'Model':<28s} | {'Raw RMSE':>10s} | {'Norm RMSE':>9s} | {'Lat ACC':>8s} | {'GPU MB':>8s} | {'Lat ms':>8s}")
-    print("-" * 85)
+    print(f"{'Model':<32s} | {'Agg nRMSE':>10s} | {'Agg ACC':>9s}")
+    print("-" * 58)
     for model_name, metrics in results_summary.items():
-        rmse_str  = f"{metrics['lat_weighted_rmse']:.2f}"      if np.isfinite(metrics['lat_weighted_rmse'])      else "inf"
-        nrmse_str = f"{metrics['lat_weighted_rmse_norm']:.4f}" if np.isfinite(metrics['lat_weighted_rmse_norm']) else "inf"
-        acc_str   = f"{metrics['lat_weighted_acc']:.4f}"       if np.isfinite(metrics['lat_weighted_acc'])       else "nan"
-        print(f"{model_name:<28s} | {rmse_str:>10s} | {nrmse_str:>9s} | {acc_str:>8s} | {metrics['peak_gpu_mem_mb']:>8.1f} | {metrics['inference_latency_ms']:>8.2f}")
+        if model_name == 'rollout_benchmark':
+            continue
+        print(f"{model_name:<32s} | {metrics['aggregate_nrmse']:>10.4f} | {metrics['aggregate_acc']:>9.4f}")
     print("=======================================================", flush=True)
 
 

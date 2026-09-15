@@ -99,7 +99,7 @@ def process_hp_era5(output_dir: str = "DATASET") -> None:
         "10m_u_component_of_wind",
         "10m_v_component_of_wind",
     ]
-    upper_air_vars = ["geopotential"]
+    upper_air_vars = ["geopotential", "temperature"]
     target_vars = surface_vars + upper_air_vars
 
     available_levels = list(ds_hp.level.values)
@@ -143,6 +143,16 @@ def process_hp_era5(output_dir: str = "DATASET") -> None:
 
     for split_name, (start_time, end_time) in splits.items():
         out_path = os.path.join(output_dir, split_name)
+
+        if os.path.exists(out_path):
+            try:
+                ds_existing = xr.open_zarr(out_path)
+                if all(v in ds_existing.data_vars for v in target_vars):
+                    print(f"\nSplit '{split_name}' already exists with all required variables. Skipping download.", flush=True)
+                    created_paths[split_name] = out_path
+                    continue
+            except Exception:
+                pass
 
         print(
             f"\nProcessing '{split_name}' from {start_time} to {end_time}...",

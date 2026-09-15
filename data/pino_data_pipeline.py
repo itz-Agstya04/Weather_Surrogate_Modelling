@@ -19,9 +19,14 @@ from torch.utils.data import Dataset, DataLoader
 
 SURFACE_VARS = ['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind']
 UPPER_AIR_VAR = 'geopotential'
+UPPER_AIR_TEMPERATURE_VAR = 'temperature'
 TARGET_LEVELS = [1000, 850, 700, 500, 300]
 
-CHANNEL_NAMES = SURFACE_VARS + [f"geopotential_{lvl}" for lvl in TARGET_LEVELS]
+CHANNEL_NAMES = (
+    SURFACE_VARS
+    + [f"geopotential_{lvl}" for lvl in TARGET_LEVELS]
+    + [f"temperature_{lvl}" for lvl in TARGET_LEVELS]
+)
 
 
 def compute_train_norm_stats(train_zarr_path: str, save_path: str = None) -> dict:
@@ -43,15 +48,24 @@ def compute_train_norm_stats(train_zarr_path: str, save_path: str = None) -> dic
         
     # 2. Upper-air variable (geopotential) computed separately per pressure level
     stats[UPPER_AIR_VAR] = {}
+    stats[UPPER_AIR_TEMPERATURE_VAR] = {}
     for lvl in TARGET_LEVELS:
         ds_lvl = ds[UPPER_AIR_VAR].sel(level=lvl)
         mean_val = float(ds_lvl.mean())
         std_val = float(ds_lvl.std())
         stats[UPPER_AIR_VAR][str(lvl)] = {'mean': mean_val, 'std': std_val}
         print(f"  geopotential_{lvl:<4d} (hPa) -> Mean: {mean_val:10.4f}, Std: {std_val:10.4f}", flush=True)
+
+        temp_lvl = ds[UPPER_AIR_TEMPERATURE_VAR].sel(level=lvl)
+        temp_mean = float(temp_lvl.mean())
+        temp_std = float(temp_lvl.std())
+        stats[UPPER_AIR_TEMPERATURE_VAR][str(lvl)] = {'mean': temp_mean, 'std': temp_std}
+        print(f"  temperature_{lvl:<4d} (hPa) -> Mean: {temp_mean:10.4f}, Std: {temp_std:10.4f}", flush=True)
         
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
         with open(save_path, 'w') as f:
             json.dump(stats, f, indent=2)
         print(f"[OK] Saved normalization stats to: {save_path}", flush=True)
@@ -73,6 +87,9 @@ class PINONormalizer:
         for lvl in TARGET_LEVELS:
             means.append(stats[UPPER_AIR_VAR][str(lvl)]['mean'])
             stds.append(stats[UPPER_AIR_VAR][str(lvl)]['std'])
+        for lvl in TARGET_LEVELS:
+            means.append(stats[UPPER_AIR_TEMPERATURE_VAR][str(lvl)]['mean'])
+            stds.append(stats[UPPER_AIR_TEMPERATURE_VAR][str(lvl)]['std'])
             
         self.channel_means = np.array(means, dtype=np.float32).reshape(-1, 1, 1)
         self.channel_stds = np.array(stds, dtype=np.float32).reshape(-1, 1, 1)
@@ -113,8 +130,8 @@ class PINONormalizer:
 
 def load_full_split_tensor(ds: xr.Dataset) -> torch.Tensor:
     """
-    Vectorized extraction of full 8-channel state tensor for all timesteps.
-    Returns torch.Tensor of shape (N, C=8, Lat=15, Lon=17).
+    Vectorized extraction of full 13-channel state tensor for all timesteps.
+    Returns torch.Tensor of shape (N, C=13, Lat, Lon).
     """
     channels = []
     
@@ -127,8 +144,12 @@ def load_full_split_tensor(ds: xr.Dataset) -> torch.Tensor:
     for lvl in TARGET_LEVELS:
         arr = ds[UPPER_AIR_VAR].sel(level=lvl).values.astype(np.float32)
         channels.append(arr)
-        
-    stacked = np.stack(channels, axis=1)  # (N, C=8, Lat=15, Lon=17)
+
+    for lvl in TARGET_LEVELS:
+        arr = ds[UPPER_AIR_TEMPERATURE_VAR].sel(level=lvl).values.astype(np.float32)
+        channels.append(arr)
+
+    stacked = np.stack(channels, axis=1)  # (N, C=13, Lat, Lon)
     return torch.from_numpy(stacked)
 
 
@@ -142,9 +163,13 @@ class HPERA5SingleStepDataset(Dataset):
         self.ds = xr.open_zarr(store_path)
         self.normalizer = normalizer
         self.transform = transform
+
+        times = self.ds.time.values
+        diffs = np.diff(times).astype('timedelta64[h]').astype(int)
+        assert np.all(diffs == 6), f"Dataset {store_path} has non-6h time gaps!"
         
         # Fast vectorized loading
-        raw_tensor = load_full_split_tensor(self.ds)  # (N, C=8, H=15, W=17)
+        raw_tensor = load_full_split_tensor(self.ds)  # (N, C=13, H, W)
         
         if self.transform and self.normalizer is not None:
             self.data = self.normalizer.normalize(raw_tensor)
@@ -224,6 +249,10 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
     except Exception as e:
         results['Check 1: Train-Only Normalization Stats'] = f"FAIL ({e})"
         
+    if not os.path.exists(stats_file):
+        print(f"[ERROR] Stats file does not exist: {stats_file}", flush=True)
+        return False
+
     with open(stats_file, 'r') as f:
         stats_dict = json.load(f)
     normalizer = PINONormalizer(stats_dict)
@@ -233,7 +262,7 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
         single_loader = get_single_step_loader(train_path, normalizer, batch_size=8, shuffle=False)
         inp_batch, tgt_batch = next(iter(single_loader))
         
-        expected_shape = (8, 8, 15, 17)  # (Batch=8, Channels=8, Lat=15, Lon=17)
+        expected_shape = (8, 13, 15, 17)  # (Batch=8, Channels=13, Lat=15, Lon=17)
         assert tuple(inp_batch.shape) == expected_shape, f"Input shape mismatch: {inp_batch.shape} vs {expected_shape}"
         assert tuple(tgt_batch.shape) == expected_shape, f"Target shape mismatch: {tgt_batch.shape} vs {expected_shape}"
         results['Check 2: Single-Step Loader Batch Shape (B, C, H, W)'] = f"PASS (Shape: {list(inp_batch.shape)})"
@@ -246,7 +275,7 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
         rollout_loader = get_rollout_loader(val_path, normalizer, sequence_length=seq_len, batch_size=4, shuffle=False)
         seq_batch = next(iter(rollout_loader))
         
-        expected_seq_shape = (4, seq_len, 8, 15, 17)
+        expected_seq_shape = (4, seq_len, 13, 15, 17)
         assert tuple(seq_batch.shape) == expected_seq_shape, f"Rollout shape mismatch: {seq_batch.shape} vs {expected_seq_shape}"
         results['Check 3: Rollout Loader Batch Shape & Contiguity'] = f"PASS (Shape: {list(seq_batch.shape)})"
     except Exception as e:
@@ -282,6 +311,7 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
     else:
         print("[ERROR] SOME PIPELINE VALIDATION CHECKS FAILED!", flush=True)
     print("=======================================================", flush=True)
+    return all_passed
 
 
 if __name__ == "__main__":
