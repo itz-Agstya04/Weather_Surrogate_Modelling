@@ -149,6 +149,10 @@ class TerrainGNNResidual(nn.Module):
             for _ in range(layers)
         ])
         self.output = nn.Linear(hidden, channels)
+        # Learnable gate: starts near-zero so the untrained GNN doesn't corrupt
+        # backbone predictions on steep cells.  The gate opens only if the GNN
+        # earns it through gradient descent — a falsifiable test of terrain signal.
+        self.gnn_scale = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         b, channels, height, width = state.shape
@@ -164,7 +168,8 @@ class TerrainGNNResidual(nn.Module):
             messages = edge_mlp(torch.cat((hidden[:, src], hidden[:, dst], edge_attr.unsqueeze(0).expand(b, -1, -1)), dim=-1))
             aggregate = torch.zeros_like(hidden).index_add_(1, dst, messages)
             hidden = hidden + update(torch.cat((hidden, aggregate), dim=-1))
-        residual = self.output(hidden)
+        # Scale output by learnable gate (initialized to 0.01)
+        residual = self.gnn_scale * self.output(hidden)
         full = torch.zeros(b, channels, height * width, device=state.device, dtype=state.dtype)
         full[:, :, indices] = residual.transpose(1, 2).to(state.dtype)
         return full.reshape(b, channels, height, width)
@@ -195,23 +200,61 @@ class SoftPhysicsPenalty:
         return compute_divergence_loss(state, normalizer), compute_hydrostatic_loss(state, normalizer)
 
 
+class IterativeCorrection(nn.Module):
+    """Small learned corrector applied repeatedly to the same forecast step."""
+
+    def __init__(self, channels: int = STATE_CHANNELS, width: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels * 3, width, 1),
+            nn.GELU(),
+            nn.Conv2d(width, width, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(width, channels, 1),
+        )
+
+    def forward(self, initial: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat((initial, candidate, candidate - initial), dim=1))
+
+
 class ProposedModel(nn.Module):
     def __init__(self, terrain_path: str = "DATASET/terrain_hp.npz", width: int = 32,
                  physics_mode: Literal["soft", "hard", "none"] = "none",
-                 use_gnn_residual: bool = True, gnn_dense: bool = False):
+                 use_gnn_residual: bool = True, gnn_dense: bool = False,
+                 refinement_steps: int = 1, refinement_alpha: float = 0.5):
         super().__init__()
         if physics_mode not in {"soft", "hard", "none"}:
             raise ValueError("physics_mode must be 'soft', 'hard', or 'none'")
+        if refinement_steps < 1:
+            raise ValueError("refinement_steps must be at least 1")
+        if not 0.0 < refinement_alpha <= 1.0:
+            raise ValueError("refinement_alpha must be in (0, 1]")
         self.physics_mode = physics_mode
+        self.refinement_steps = refinement_steps
+        self.refinement_alpha = refinement_alpha
         terrain_data = load_terrain_artifact(terrain_path)
         self.backbone = FactorizedFNO2d(width=width)
         self.register_buffer("terrain_features", terrain_data["terrain_features"])
         self.use_gnn_residual = use_gnn_residual
         self.gnn = TerrainGNNResidual(terrain_path, gnn_dense=gnn_dense, terrain_data=terrain_data) if use_gnn_residual else None
+        self.corrector = (
+            IterativeCorrection(width=width)
+            if refinement_steps > 1 else nn.Identity()
+        )
         self.projection = LerayProjection2d() if physics_mode == "hard" else nn.Identity()
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         output = self.backbone(state, self.terrain_features)
         if self.gnn is not None:
             output = output + self.gnn(state)
-        return self.projection(output)
+        output = self.projection(output)
+        if self.refinement_steps == 1:
+            return output
+
+        # Every pass targets the same next state.  This is a learned fixed-point
+        # refinement, not another time step, so the temporal rollout remains in
+        # train_baselines.fine_tune_rollout and is not duplicated here.
+        for _ in range(self.refinement_steps - 1):
+            correction = self.corrector(state, output)
+            output = self.projection(output + self.refinement_alpha * correction)
+        return output

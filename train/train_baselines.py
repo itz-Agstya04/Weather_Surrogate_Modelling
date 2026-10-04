@@ -177,8 +177,8 @@ def compute_divergence_loss(pred_state: torch.Tensor, normalizer: PINONormalizer
     Dimensionless differences are O(0.1) in normalized space, giving a useful gradient signal.
     """
     if normalizer is not None:
-        u = pred_state[:, 1].float() * float(normalizer.channel_stds[1]) + float(normalizer.channel_means[1])
-        v = pred_state[:, 2].float() * float(normalizer.channel_stds[2]) + float(normalizer.channel_means[2])
+        u = pred_state[:, 1].float() * float(normalizer.channel_stds[1].item()) + float(normalizer.channel_means[1].item())
+        v = pred_state[:, 2].float() * float(normalizer.channel_stds[2].item()) + float(normalizer.channel_means[2].item())
     else:
         u, v = pred_state[:, 1].float(), pred_state[:, 2].float()
 
@@ -417,9 +417,15 @@ def calculate_metrics(preds_raw: torch.Tensor, tgts_raw: torch.Tensor,
     # ACC uses the training climatology when supplied. This avoids using test
     # targets to define the anomaly reference.
     if climatology is None:
-        climatology = (tgts_raw * weights).sum(dim=(0, 2, 3)) / denom
-    pred_anom = preds_raw - climatology.reshape(1, -1, 1, 1)
-    tgt_anom = tgts_raw - climatology.reshape(1, -1, 1, 1)
+        clim = ((tgts_raw * weights).sum(dim=(0, 2, 3)) / denom).reshape(1, -1, 1, 1)
+    elif climatology.ndim == 1:
+        clim = climatology.reshape(1, -1, 1, 1)
+    elif climatology.ndim == 3:
+        clim = climatology.unsqueeze(0)
+    else:
+        clim = climatology
+    pred_anom = preds_raw - clim
+    tgt_anom = tgts_raw - clim
     cov = (weights * pred_anom * tgt_anom).sum(dim=(0, 2, 3))
     pred_var = (weights * pred_anom.square()).sum(dim=(0, 2, 3))
     tgt_var = (weights * tgt_anom.square()).sum(dim=(0, 2, 3))
@@ -561,33 +567,41 @@ def run_baseline_experiments():
     b1_best_val = float('inf')
     b1_no_improve = 0
     b1_best_state = None
+    fno_ckpt = os.path.join("DATASET", "checkpoints", "fno.pt")
 
-    for epoch in range(1, epochs + 1):
-        tr_loss, tr_data, _, _, _ = train_one_epoch(
-            b1_model, train_loader, b1_optimizer, device,
-            use_physics_loss=False, max_grad_norm=max_grad_norm
-        )
-        vl_loss, vl_data = validate(b1_model, val_loader, device, use_physics_loss=False)
-        b1_scheduler.step()
+    if os.path.exists(fno_ckpt):
+        print(f"  [Found Checkpoint] Loading existing B1 weights from {fno_ckpt}", flush=True)
+        try:
+            b1_best_state = torch.load(fno_ckpt, map_location=device, weights_only=True)
+        except TypeError:
+            b1_best_state = torch.load(fno_ckpt, map_location=device)
+    else:
+        for epoch in range(1, epochs + 1):
+            tr_loss, tr_data, _, _, _ = train_one_epoch(
+                b1_model, train_loader, b1_optimizer, device,
+                use_physics_loss=False, max_grad_norm=max_grad_norm
+            )
+            vl_loss, vl_data = validate(b1_model, val_loader, device, use_physics_loss=False)
+            b1_scheduler.step()
 
-        b1_train_losses.append(tr_loss)
-        b1_val_losses.append(vl_loss)
+            b1_train_losses.append(tr_loss)
+            b1_val_losses.append(vl_loss)
 
-        improved = vl_loss < b1_best_val
-        if improved:
-            b1_best_val = vl_loss
-            b1_best_state = {k: v.cpu().clone() for k, v in b1_model.state_dict().items()}
-            b1_no_improve = 0
-        else:
-            b1_no_improve += 1
+            improved = vl_loss < b1_best_val
+            if improved:
+                b1_best_val = vl_loss
+                b1_best_state = {k: v.cpu().clone() for k, v in b1_model.state_dict().items()}
+                b1_no_improve = 0
+            else:
+                b1_no_improve += 1
 
-        marker = " *" if improved else ""
-        print(f"  B1 Epoch {epoch:2d}/{epochs} -> Train: {tr_loss:.5f} | Val: {vl_loss:.5f} | LR: {b1_scheduler.get_last_lr()[0]:.2e}{marker}", flush=True)
-        assert not np.isnan(tr_loss) and not np.isnan(vl_loss), "Baseline 1 Loss is NaN!"
+            marker = " *" if improved else ""
+            print(f"  B1 Epoch {epoch:2d}/{epochs} -> Train: {tr_loss:.5f} | Val: {vl_loss:.5f} | LR: {b1_scheduler.get_last_lr()[0]:.2e}{marker}", flush=True)
+            assert not np.isnan(tr_loss) and not np.isnan(vl_loss), "Baseline 1 Loss is NaN!"
 
-        if b1_no_improve >= patience:
-            print(f"  [Early Stop] No val improvement for {patience} epochs. Best val: {b1_best_val:.5f}", flush=True)
-            break
+            if b1_no_improve >= patience:
+                print(f"  [Early Stop] No val improvement for {patience} epochs. Best val: {b1_best_val:.5f}", flush=True)
+                break
 
     # Restore best weights
     if b1_best_state is not None:
@@ -622,37 +636,45 @@ def run_baseline_experiments():
     b2_best_val = float('inf')
     b2_no_improve = 0
     b2_best_state = None
+    pino_ckpt = os.path.join("DATASET", "checkpoints", "pino.pt")
 
-    for epoch in range(1, epochs + 1):
-        tr_loss, tr_data, tr_div, tr_hydro, tr_physics_grad = train_one_epoch(
-            b2_model, train_loader, b2_optimizer, device,
-            use_physics_loss=True, lambda_div=0.01, lambda_hydro=0.1,
-            max_grad_norm=max_grad_norm, normalizer=normalizer
-        )
-        vl_loss, vl_data = validate(
-            b2_model, val_loader, device, use_physics_loss=True,
-            lambda_div=0.01, lambda_hydro=0.1, normalizer=normalizer
-        )
-        b2_scheduler.step()
+    if os.path.exists(pino_ckpt):
+        print(f"  [Found Checkpoint] Loading existing B2 weights from {pino_ckpt}", flush=True)
+        try:
+            b2_best_state = torch.load(pino_ckpt, map_location=device, weights_only=True)
+        except TypeError:
+            b2_best_state = torch.load(pino_ckpt, map_location=device)
+    else:
+        for epoch in range(1, epochs + 1):
+            tr_loss, tr_data, tr_div, tr_hydro, tr_physics_grad = train_one_epoch(
+                b2_model, train_loader, b2_optimizer, device,
+                use_physics_loss=True, lambda_div=0.01, lambda_hydro=0.1,
+                max_grad_norm=max_grad_norm, normalizer=normalizer
+            )
+            vl_loss, vl_data = validate(
+                b2_model, val_loader, device, use_physics_loss=True,
+                lambda_div=0.01, lambda_hydro=0.1, normalizer=normalizer
+            )
+            b2_scheduler.step()
 
-        b2_train_losses.append(tr_loss)
-        b2_val_losses.append(vl_loss)
+            b2_train_losses.append(tr_loss)
+            b2_val_losses.append(vl_loss)
 
-        improved = vl_loss < b2_best_val
-        if improved:
-            b2_best_val = vl_loss
-            b2_best_state = {k: v.cpu().clone() for k, v in b2_model.state_dict().items()}
-            b2_no_improve = 0
-        else:
-            b2_no_improve += 1
+            improved = vl_loss < b2_best_val
+            if improved:
+                b2_best_val = vl_loss
+                b2_best_state = {k: v.cpu().clone() for k, v in b2_model.state_dict().items()}
+                b2_no_improve = 0
+            else:
+                b2_no_improve += 1
 
-        marker = " *" if improved else ""
-        print(f"  B2 Epoch {epoch:2d}/{epochs} -> Total: {tr_loss:.5f} (Data: {tr_data:.5f} Div: {tr_div:.7f} Hydro: {tr_hydro:.7f} PhysicsGrad: {tr_physics_grad:.3e}) | Val: {vl_loss:.5f}{marker}", flush=True)
-        assert not np.isnan(tr_loss) and not np.isnan(vl_loss), "Baseline 2 Loss is NaN!"
+            marker = " *" if improved else ""
+            print(f"  B2 Epoch {epoch:2d}/{epochs} -> Total: {tr_loss:.5f} (Data: {tr_data:.5f} Div: {tr_div:.7f} Hydro: {tr_hydro:.7f} PhysicsGrad: {tr_physics_grad:.3e}) | Val: {vl_loss:.5f}{marker}", flush=True)
+            assert not np.isnan(tr_loss) and not np.isnan(vl_loss), "Baseline 2 Loss is NaN!"
 
-        if b2_no_improve >= patience:
-            print(f"  [Early Stop] No val improvement for {patience} epochs. Best val: {b2_best_val:.5f}", flush=True)
-            break
+            if b2_no_improve >= patience:
+                print(f"  [Early Stop] No val improvement for {patience} epochs. Best val: {b2_best_val:.5f}", flush=True)
+                break
 
     # Restore best weights
     if b2_best_state is not None:
@@ -684,7 +706,8 @@ def run_baseline_experiments():
     print(f"{'Model':<28s} | {'Horizon':>7s} | {'Agg nRMSE':>10s} | {'Agg ACC':>9s}")
     print("-" * 64)
     for model_name, horizons in rollout_results.items():
-        for horizon, metrics in horizons.items():
+        for horizon, metrics_entry in horizons.items():
+            metrics = metrics_entry.get('FNO', metrics_entry)
             print(f"{model_name:<28s} | {horizon:>7s} | {metrics['aggregate_nrmse']:>10.4f} | {metrics['aggregate_acc']:>9.4f}")
 
     # Save Results Table JSON

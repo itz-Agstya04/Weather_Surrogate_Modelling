@@ -99,6 +99,31 @@ def run_spatial_error_analysis(
     if models_dict is None:
         models_dict = {"Persistence": None}
 
+        fno_path = "DATASET/checkpoints/fno.pt"
+        if os.path.exists(fno_path):
+            fno = CoordinateFNO2d(in_dim=13, out_dim=13, width=32).to(device)
+            fno.load_state_dict(torch.load(fno_path, map_location=device, weights_only=True))
+            models_dict["Baseline 1 (FNO)"] = fno
+
+        pino_path = "DATASET/checkpoints/pino.pt"
+        if os.path.exists(pino_path):
+            pino = CoordinateFNO2d(in_dim=13, out_dim=13, width=32).to(device)
+            pino.load_state_dict(torch.load(pino_path, map_location=device, weights_only=True))
+            models_dict["Baseline 2 (PINO)"] = pino
+
+        proposed_ckpt = "DATASET/checkpoints/FactorizedFNO_GNNOff_soft_R3.pt"
+        if os.path.exists(proposed_ckpt):
+            proposed = ProposedModel(
+                terrain_path=terrain_path,
+                physics_mode="soft",
+                use_gnn_residual=False,
+                gnn_dense=False,
+                refinement_steps=3,
+                refinement_alpha=0.5,
+            ).to(device)
+            proposed.load_state_dict(torch.load(proposed_ckpt, map_location=device, weights_only=True))
+            models_dict["Proposed (Factorized FNO + Soft Phys R3)"] = proposed
+
     for model_name, model_inst in models_dict.items():
         cell_rmse = compute_spatial_error(model_inst, test_loader, normalizer, device)
         

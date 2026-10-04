@@ -80,7 +80,8 @@ def main():
             print("=== STEP 3: skipped; all splits already contain temperature ===", flush=True)
     step(4, [sys.executable, "-m", "data.pino_data_pipeline"], ["DATASET/norm_stats.json"], [f"DATASET/{name}" for name in SPLITS])
     step(5, [sys.executable, "-m", "train.train_baselines"], ["DATASET/baseline_results.json"], ["DATASET/norm_stats.json", "DATASET/train_2018_2019.zarr", "DATASET/val_2020.zarr", "DATASET/test_2021_2022.zarr"])
-    step(6, [sys.executable, "-m", "train.train_proposed"], ["DATASET/proposed_results.json"], ["DATASET/terrain_hp.npz", "DATASET/norm_stats.json"])
+    # Screen all proposed ablations cheaply, then fully train only the survivors.
+    step(6, [sys.executable, "-m", "ablations.search_proposed", "--budget-hours", "1", "--top-k", "1", "--screen-epochs", "5", "--full-epochs", "15", "--rollout-epochs", "1"], ["DATASET/proposed_results.json"], ["DATASET/terrain_hp.npz", "DATASET/norm_stats.json"])
     step(7, [sys.executable, "-m", "analysis.spatial_error_analysis"], ["DATASET/spatial_error_analysis.csv", "DATASET/spatial_error_summary.json"], ["DATASET/baseline_results.json", "DATASET/proposed_results.json"])
     step(8, [sys.executable, "-m", "analysis.build_comparison_table"], ["DATASET/comparison_table.csv"], ["DATASET/baseline_results.json", "DATASET/proposed_results.json"])
 
