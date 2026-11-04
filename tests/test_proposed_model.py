@@ -5,7 +5,8 @@ import os
 import pytest
 import torch
 
-from train.proposed_model import FactorizedFNO2d, LerayProjection2d, TerrainGNNResidual
+from models.proposed_model import FactorizedFNO2d, LerayProjection2d, TerrainGNNResidual
+from models.residual import ResidualStep
 from train.train_baselines import CoordinateFNO2d
 
 
@@ -44,3 +45,12 @@ def test_leray_projection_is_divergence_free():
     assert divergence.abs().max().item() < 1e-4
     assert torch.equal(projected[:, 0], state[:, 0])
     assert torch.equal(projected[:, 3:], state[:, 3:])
+
+
+def test_residual_step_zero_net_returns_input():
+    net = torch.nn.Conv2d(13, 13, 1)
+    torch.nn.init.zeros_(net.weight)
+    torch.nn.init.zeros_(net.bias)
+    model = ResidualStep(net, torch.ones(13))
+    state = torch.randn(2, 13, 15, 17)
+    assert torch.equal(model(state), state)

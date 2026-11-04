@@ -8,6 +8,9 @@ def test_spectral_conv_preserves_shape_even_and_odd_modes():
     for modes1, modes2 in [(8, 6), (31, 29)]:
         layer = SpectralConv2d(3, 5, modes1, modes2)
         assert layer(torch.randn(2, 3, 15, 17)).shape == (2, 5, 15, 17)
+        assert layer(torch.randn(2, 3, 101, 101)).shape == (2, 5, 101, 101)
+        assert not hasattr(layer, "weights3")
+        assert not hasattr(layer, "weights4")
 
 
 def test_coordinates_are_unit_norm_pairs():

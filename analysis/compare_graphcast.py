@@ -1,12 +1,13 @@
 import os, sys, json, torch
 import numpy as np
 import xarray as xr
+from data.store import open_project_zarr
 import pandas as pd
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 from data.pino_data_pipeline import PINONormalizer, load_full_split_tensor, TARGET_LEVELS, SURFACE_VARS
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -22,7 +23,7 @@ def run_comparison():
     model.load_state_dict(torch.load('DATASET/checkpoints/FactorizedFNO_GNNOff_soft_R3.pt', map_location=DEVICE, weights_only=True))
     model.eval()
 
-    ds = xr.open_zarr('DATASET/test_2021_2022.zarr')
+    ds = open_project_zarr('DATASET/test_2021_2022.zarr', consolidated=True)
     
     # We will pick a specific timestamp to compare:
     init_time = pd.Timestamp('2021-01-02T00:00:00')

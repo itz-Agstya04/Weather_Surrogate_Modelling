@@ -15,6 +15,7 @@ import json
 import torch
 import numpy as np
 import xarray as xr
+from data.store import open_project_zarr
 import pandas as pd
 
 # We use the local weatherbench2 library
@@ -23,7 +24,7 @@ from weatherbench2.evaluation import evaluate_in_memory
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 from data.pino_data_pipeline import PINONormalizer, get_rollout_loader, CHANNEL_NAMES
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -43,7 +44,7 @@ def run_wb2_evaluation():
     model.eval()
 
     # We need the actual test dataset to get coordinates
-    test_ds = xr.open_zarr('DATASET/test_2021_2022.zarr')
+    test_ds = open_project_zarr('DATASET/test_2021_2022.zarr', consolidated=True)
     times = test_ds.time.values
     lats = test_ds.latitude.values
     lons = test_ds.longitude.values

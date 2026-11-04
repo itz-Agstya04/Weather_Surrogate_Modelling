@@ -30,7 +30,7 @@ if PROJECT_ROOT not in sys.path:
 
 from data.pino_data_pipeline import PINONormalizer, get_single_step_loader, CHANNEL_NAMES
 from train.train_baselines import CoordinateFNO2d
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 
 
 @torch.no_grad()

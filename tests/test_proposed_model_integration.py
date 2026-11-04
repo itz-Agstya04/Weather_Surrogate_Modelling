@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 
 
 @pytest.mark.parametrize("physics_mode", ["none", "soft", "hard"])

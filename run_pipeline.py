@@ -20,9 +20,9 @@ def exists(path):
 
 
 def zarr_has_required(path):
-    import xarray as xr
+    from data.store import open_project_zarr
     try:
-        ds = xr.open_zarr(os.path.join(ROOT, path))
+        ds = open_project_zarr(os.path.join(ROOT, path), consolidated=True)
         return REQUIRED_VARS.issubset(ds.data_vars)
     except Exception:
         return False
@@ -54,7 +54,7 @@ def run_command(step, command, log):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--from-step", type=int, default=1, choices=range(1, 9))
+    parser.add_argument("--from-step", type=int, default=1, choices=range(1, 10))
     parser.add_argument("--skip-existing", action="store_true", help="Reuse artifacts when their required contents exist.")
     args = parser.parse_args()
     os.makedirs(DATASET, exist_ok=True)
@@ -78,12 +78,14 @@ def main():
             run_command(3, [sys.executable, "-m", "data.update_splits_temperature", *missing], log)
         else:
             print("=== STEP 3: skipped; all splits already contain temperature ===", flush=True)
-    step(4, [sys.executable, "-m", "data.pino_data_pipeline"], ["DATASET/norm_stats.json"], [f"DATASET/{name}" for name in SPLITS])
-    step(5, [sys.executable, "-m", "train.train_baselines"], ["DATASET/baseline_results.json"], ["DATASET/norm_stats.json", "DATASET/train_2018_2019.zarr", "DATASET/val_2020.zarr", "DATASET/test_2021_2022.zarr"])
+    # This is a hard gate: no normalization, training, or evaluation may run before it.
+    step(4, [sys.executable, "-m", "data.validate_era5"], (), [f"DATASET/{name}" for name in SPLITS])
+    step(5, [sys.executable, "-m", "data.pino_data_pipeline"], ["DATASET/norm_stats.json"], [f"DATASET/{name}" for name in SPLITS])
+    step(6, [sys.executable, "-m", "train.train_baselines"], ["DATASET/baseline_results.json"], ["DATASET/norm_stats.json", "DATASET/train_2018_2019.zarr", "DATASET/val_2020.zarr", "DATASET/test_2021_2022.zarr"])
     # Screen all proposed ablations cheaply, then fully train only the survivors.
-    step(6, [sys.executable, "-m", "ablations.search_proposed", "--budget-hours", "1", "--top-k", "1", "--screen-epochs", "5", "--full-epochs", "15", "--rollout-epochs", "1"], ["DATASET/proposed_results.json"], ["DATASET/terrain_hp.npz", "DATASET/norm_stats.json"])
-    step(7, [sys.executable, "-m", "analysis.spatial_error_analysis"], ["DATASET/spatial_error_analysis.csv", "DATASET/spatial_error_summary.json"], ["DATASET/baseline_results.json", "DATASET/proposed_results.json"])
-    step(8, [sys.executable, "-m", "analysis.build_comparison_table"], ["DATASET/comparison_table.csv"], ["DATASET/baseline_results.json", "DATASET/proposed_results.json"])
+    step(7, [sys.executable, "-m", "ablations.search_proposed", "--budget-hours", "1", "--top-k", "1", "--screen-epochs", "5", "--full-epochs", "15", "--rollout-epochs", "1"], ["DATASET/proposed_results.json"], ["DATASET/terrain_hp.npz", "DATASET/norm_stats.json"])
+    step(8, [sys.executable, "-m", "analysis.spatial_error_analysis"], ["DATASET/spatial_error_analysis.csv", "DATASET/spatial_error_summary.json"], ["DATASET/baseline_results.json", "DATASET/proposed_results.json"])
+    step(9, [sys.executable, "-m", "analysis.build_comparison_table"], ["DATASET/comparison_table.csv"], ["DATASET/baseline_results.json", "DATASET/proposed_results.json"])
 
     try:
         runtime = subprocess.check_output([

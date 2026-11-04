@@ -5,6 +5,8 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
+*.log
+logs/
 
 # Test, type-checker, and notebook caches
 .pytest_cache/
@@ -22,28 +24,38 @@ DATASET/
 *.nc4
 *.h5
 *.hdf5
+*.zip
+*.tar
+*.tar.gz
 
-# Trained weights, checkpoints, and experiment outputs
+# Trained weights, checkpoints, and binary experiment artifacts
 *.pt
 *.pth
 *.ckpt
 *.onnx
 *.npy
 *.npz
-results/
 wandb/
 lightning_logs/
 
-# Secrets and local configuration
+# Intellectual property & patent disclosures (protect prior to formal filing)
+patent_pack/
+PATENT_*.md
+PATENT_*
+
+# Secrets and local credentials
 .env
 .env.*
 !.env.example
 *.pem
 *.key
 service-account*.json
+*.secret
 
-# Editor and operating-system files
+# Editor, OS, and scratch files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+scratch*.py
+temp_*

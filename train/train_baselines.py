@@ -34,6 +34,9 @@ from data.pino_data_pipeline import (
     TARGET_LEVELS,
     CHANNEL_NAMES as STATE_CHANNEL_NAMES
 )
+from models.residual import ResidualStep, step_loss
+
+AMP = False
 
 
 def save_checkpoint(state_dict: dict, name: str, directory: str = "DATASET/checkpoints") -> str:
@@ -73,8 +76,6 @@ class SpectralConv2d(nn.Module):
         shape = (in_channels, out_channels, modes1, modes2)
         self.weights1 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
         self.weights2 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
-        self.weights3 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
-        self.weights4 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
 
     def compl_mul2d(self, input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         return torch.einsum("bixy,ioxy->boxy", input_tensor, weights)
@@ -82,24 +83,27 @@ class SpectralConv2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batchsize = x.shape[0]
         dtype = x.dtype
-        height, width = x.shape[-2:]
-        x_ft = torch.fft.rfft2(x.float(), dim=(-2, -1))
+        orig_h, orig_w = x.shape[-2:]
+        pad_top, pad_bottom = 3, 3
+        pad_left, pad_right = 4, 4
+        x_pad = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
+        height, width = x_pad.shape[-2:]
+        x_ft = torch.fft.rfft2(x_pad.float(), dim=(-2, -1))
 
         out_ft = torch.zeros(
             batchsize, self.out_channels, height, width // 2 + 1,
             dtype=torch.cfloat, device=x.device
         )
 
-        m1 = min(self.modes1, height // 2 + 1)
+        m1 = min(self.modes1, height // 2)
         m2 = min(self.modes2, width // 2 + 1)
 
         out_ft[:, :, :m1, :m2] = self.compl_mul2d(x_ft[:, :, :m1, :m2], self.weights1[:, :, :m1, :m2])
         out_ft[:, :, -m1:, :m2] = self.compl_mul2d(x_ft[:, :, -m1:, :m2], self.weights2[:, :, :m1, :m2])
-        out_ft[:, :, :m1, -m2:] = self.compl_mul2d(x_ft[:, :, :m1, -m2:], self.weights3[:, :, :m1, :m2])
-        out_ft[:, :, -m1:, -m2:] = self.compl_mul2d(x_ft[:, :, -m1:, -m2:], self.weights4[:, :, :m1, :m2])
 
         x_out = torch.fft.irfft2(out_ft, s=(height, width))
-        return x_out.to(dtype=dtype)
+        x_crop = x_out[:, :, pad_top:pad_top + orig_h, pad_left:pad_left + orig_w]
+        return x_crop.to(dtype=dtype)
 
 
 class CoordinateFNO2d(nn.Module):
@@ -252,6 +256,7 @@ def train_one_epoch(
     lambda_hydro: float = 0.01,
     max_grad_norm: float = 1.0,
     normalizer: PINONormalizer = None,
+    step_std: torch.Tensor = None,
 ):
     model.train()
     total_loss = 0.0
@@ -266,9 +271,9 @@ def train_one_epoch(
         inp, tgt = inp.to(device), tgt.to(device)
         optimizer.zero_grad()
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
+        with torch.amp.autocast(device_type=device.type, enabled=AMP):
             pred = model(inp)
-            data_loss = F.mse_loss(pred, tgt)
+            data_loss = step_loss(pred, tgt, step_std) if step_std is not None else F.mse_loss(pred, tgt)
 
             if use_physics_loss:
                 div_loss = compute_divergence_loss(pred, normalizer=normalizer)
@@ -314,6 +319,7 @@ def validate(
     lambda_div: float = 0.01,
     lambda_hydro: float = 0.01,
     normalizer: PINONormalizer = None,
+    step_std: torch.Tensor = None,
 ):
     model.eval()
     total_loss = 0.0
@@ -323,9 +329,9 @@ def validate(
 
     for inp, tgt in loader:
         inp, tgt = inp.to(device), tgt.to(device)
-        with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
+        with torch.amp.autocast(device_type=device.type, enabled=AMP):
             pred = model(inp)
-            data_loss = F.mse_loss(pred, tgt)
+            data_loss = step_loss(pred, tgt, step_std) if step_std is not None else F.mse_loss(pred, tgt)
 
             if use_physics_loss:
                 div_loss = compute_divergence_loss(pred, normalizer=normalizer)
@@ -350,7 +356,8 @@ def fine_tune_rollout(
     rollout_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    epochs: int = 3
+    epochs: int = 3,
+    step_std: torch.Tensor = None,
 ):
     model.train()
     use_cuda = device.type == 'cuda'
@@ -368,7 +375,7 @@ def fine_tune_rollout(
 
             optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
+            with torch.amp.autocast(device_type=device.type, enabled=AMP):
                 current_state = seq_batch[:, 0, :, :, :]  # Initial state t=0
                 loss = 0.0
 
@@ -376,7 +383,7 @@ def fine_tune_rollout(
                     target_state = seq_batch[:, t_step, :, :, :]
                     pred_state = model(current_state)
 
-                    loss = loss + F.mse_loss(pred_state, target_state)
+                    loss = loss + (step_loss(pred_state, target_state, step_std) if step_std is not None else F.mse_loss(pred_state, target_state))
                     current_state = pred_state  # Autoregressive feed forward
 
                 loss = loss / (T - 1)
@@ -455,7 +462,7 @@ def evaluate_model_on_test(model: nn.Module, test_loader: DataLoader,
     batches = 0
     for inp, tgt in test_loader:
         inp, tgt = inp.to(device), tgt.to(device)
-        with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
+        with torch.amp.autocast(device_type=device.type, enabled=AMP):
             pred = model(inp)
         predictions.append(normalizer.denormalize(pred.float()).cpu())
         targets.append(normalizer.denormalize(tgt.float()).cpu())
@@ -496,7 +503,7 @@ def evaluate_rollout_horizons(model: nn.Module, rollout_loader: DataLoader,
         initial = current
         for horizon in range(max_horizon):
             target = sequence[:, horizon + 1]
-            with torch.amp.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+            with torch.amp.autocast(device_type=device.type, enabled=AMP):
                 current = model(current)
             model_predictions[horizon].append(normalizer.denormalize(current.float()).cpu())
             persistence_predictions[horizon].append(normalizer.denormalize(initial.float()).cpu())

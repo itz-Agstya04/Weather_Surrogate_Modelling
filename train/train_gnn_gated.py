@@ -2,7 +2,7 @@
 import json, sys, torch
 sys.path.insert(0, '.')
 from data.pino_data_pipeline import PINONormalizer, get_single_step_loader
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 from train.train_baselines import train_one_epoch, validate, save_checkpoint
 
 DEVICE = torch.device('cuda')

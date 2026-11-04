@@ -8,6 +8,7 @@ import os
 import dask
 import xarray as xr
 import numpy as np
+from data.store import open_project_zarr
 
 ERA5_ZARR_URL = (
     "gs://weatherbench2/datasets/era5/"
@@ -23,9 +24,8 @@ def add_temperature_to_splits(split_names: list[str], output_dir: str = "DATASET
     for split_name in split_names:
         zarr_path = os.path.join(output_dir, split_name)
         if not os.path.exists(zarr_path):
-            print(f"Split path {zarr_path} does not exist. Skipping.", flush=True)
-            continue
-        local_ds = xr.open_zarr(zarr_path)
+            raise FileNotFoundError(f"Required split store does not exist: {zarr_path}")
+        local_ds = open_project_zarr(zarr_path, consolidated=True)
         if "temperature" in local_ds.data_vars:
             print(f"  'temperature' already exists in {split_name}. Skipping.", flush=True)
         else:
@@ -78,7 +78,7 @@ def add_temperature_to_splits(split_names: list[str], output_dir: str = "DATASET
         temp_ds.to_zarr(zarr_path, mode="a")
         print(f"  [OK] Successfully added 'temperature' to {zarr_path}!", flush=True)
 
-        check_ds = xr.open_zarr(zarr_path)
+        check_ds = open_project_zarr(zarr_path, consolidated=True)
         assert "temperature" in check_ds.data_vars, f"Failed to verify temperature in {zarr_path}"
         print(f"  Verified data variables: {list(check_ds.data_vars)}", flush=True)
 

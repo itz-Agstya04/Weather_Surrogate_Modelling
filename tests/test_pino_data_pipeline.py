@@ -66,6 +66,7 @@ def test_rollout_dataset_real_store_and_noncontiguous(monkeypatch):
     mock[UPPER_AIR_VAR] = (("time", "level", "latitude", "longitude"), np.zeros((3, 5, 15, 17), dtype=np.float32))
     mock[UPPER_AIR_TEMPERATURE_VAR] = mock[UPPER_AIR_VAR].copy()
     mock = mock.assign_coords(time=times, level=TARGET_LEVELS, latitude=np.arange(15), longitude=np.arange(17))
-    monkeypatch.setattr("data.pino_data_pipeline.xr.open_zarr", lambda _: mock)
+    monkeypatch.setattr("data.pino_data_pipeline.open_project_zarr", lambda *args, **kwargs: mock)
     with pytest.raises(AssertionError, match="non-6h time gaps"):
         HPERA5RolloutDataset("mock.zarr", transform=False)
+

@@ -20,7 +20,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from data.pino_data_pipeline import PINONormalizer, get_single_step_loader
-from train.proposed_model import ProposedModel
+from data.store import open_project_zarr
+from models.proposed_model import ProposedModel
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TERRAIN_PATH = "DATASET/terrain_hp.npz"
@@ -201,8 +202,7 @@ def run_gnn_diagnosis():
     # DIAGNOSTIC 4: How separable are the steep/flat ERA5 signals?
     # ============================================================
     print("\n--- Q4: Steep vs flat ERA5 temporal variance (is signal separable?) ---")
-    import xarray as xr
-    ds_test = xr.open_zarr(TEST_ZARR)
+    ds_test = open_project_zarr(TEST_ZARR, consolidated=True)
     t2m = ds_test["2m_temperature"].values  # (N, H, W)
     steep_2d = steep_mask.numpy()
     temporal_var_steep = t2m[:, steep_2d].var(axis=0).mean()

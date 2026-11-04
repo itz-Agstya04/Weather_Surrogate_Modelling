@@ -149,12 +149,20 @@ class TerrainGNNResidual(nn.Module):
             for _ in range(layers)
         ])
         self.output = nn.Linear(hidden, channels)
-        # Learnable gate: starts near-zero so the untrained GNN doesn't corrupt
-        # backbone predictions on steep cells.  The gate opens only if the GNN
-        # earns it through gradient descent — a falsifiable test of terrain signal.
         self.gnn_scale = nn.Parameter(torch.tensor(0.01))
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        height, width = self.terrain_features.shape[1], self.terrain_features.shape[2]
+        lat = torch.linspace(33.5, 30.0, height, dtype=torch.float32)
+        dlat_rad = torch.abs(lat[1] - lat[0]) * (np.pi / 180.0)
+        dlon_rad = (4.0 / (width - 1)) * (np.pi / 180.0)
+        earth_radius = 6_371_000.0
+        phi = lat * (np.pi / 180.0)
+        cos_phi = torch.cos(phi).view(1, height, 1)
+
+        self.register_buffer("dy_2a", 2.0 * earth_radius * dlat_rad)
+        self.register_buffer("dx_2a", 2.0 * earth_radius * cos_phi * dlon_rad)
+
+    def forward(self, state: torch.Tensor, return_residual_wind_only: bool = False) -> torch.Tensor:
         b, channels, height, width = state.shape
         flat = state.flatten(2).transpose(1, 2)
         terrain_flat = self.terrain_features.flatten(1).transpose(0, 1)
@@ -168,31 +176,27 @@ class TerrainGNNResidual(nn.Module):
             messages = edge_mlp(torch.cat((hidden[:, src], hidden[:, dst], edge_attr.unsqueeze(0).expand(b, -1, -1)), dim=-1))
             aggregate = torch.zeros_like(hidden).index_add_(1, dst, messages)
             hidden = hidden + update(torch.cat((hidden, aggregate), dim=-1))
-        # Scale output by learnable gate (initialized to 0.01)
         residual = self.gnn_scale * self.output(hidden)
         full = torch.zeros(b, channels, height * width, device=state.device, dtype=state.dtype)
         full[:, :, indices] = residual.transpose(1, 2).to(state.dtype)
-        return full.reshape(b, channels, height, width)
+        full = full.reshape(b, channels, height, width)
 
+        psi = torch.zeros(b, height * width, device=state.device, dtype=state.dtype)
+        psi[:, indices] = residual[:, :, 1].to(state.dtype)
+        psi = psi.reshape(b, height, width)
 
-class LerayProjection2d(nn.Module):
-    """Differentiable spectral projection of u/v onto divergence-free fields."""
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        u, v = state[:, 1], state[:, 2]
-        height, width = u.shape[-2:]
-        u_hat = torch.fft.rfft2(u.float())
-        v_hat = torch.fft.rfft2(v.float())
-        ky = torch.fft.fftfreq(height, device=state.device).reshape(-1, 1)
-        kx = torch.fft.rfftfreq(width, device=state.device).reshape(1, -1)
-        denom = kx.square() + ky.square()
-        denom = torch.where(denom == 0, torch.ones_like(denom), denom)
-        parallel = (kx * u_hat + ky * v_hat) / denom
-        u_projected = u_hat - kx * parallel
-        v_projected = v_hat - ky * parallel
-        output = state.clone()
-        output[:, 1] = torch.fft.irfft2(u_projected, s=(height, width)).to(state.dtype)
-        output[:, 2] = torch.fft.irfft2(v_projected, s=(height, width)).to(state.dtype)
-        return output
+        u_res = torch.zeros(b, height, width, device=state.device, dtype=state.dtype)
+        u_res[:, 1:-1, :] = (psi[:, 2:, :] - psi[:, :-2, :]) / self.dy_2a
+
+        v_res = torch.zeros(b, height, width, device=state.device, dtype=state.dtype)
+        v_res[:, :, 1:-1] = (psi[:, :, 2:] - psi[:, :, :-2]) / self.dx_2a
+
+        if return_residual_wind_only:
+            return torch.stack((u_res, v_res), dim=1)
+
+        full[:, 1] = u_res
+        full[:, 2] = v_res
+        return full
 
 
 class SoftPhysicsPenalty:
@@ -201,8 +205,6 @@ class SoftPhysicsPenalty:
 
 
 class IterativeCorrection(nn.Module):
-    """Small learned corrector applied repeatedly to the same forecast step."""
-
     def __init__(self, channels: int = STATE_CHANNELS, width: int = 32):
         super().__init__()
         self.net = nn.Sequential(
@@ -241,20 +243,15 @@ class ProposedModel(nn.Module):
             IterativeCorrection(width=width)
             if refinement_steps > 1 else nn.Identity()
         )
-        self.projection = LerayProjection2d() if physics_mode == "hard" else nn.Identity()
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         output = self.backbone(state, self.terrain_features)
         if self.gnn is not None:
             output = output + self.gnn(state)
-        output = self.projection(output)
         if self.refinement_steps == 1:
             return output
 
-        # Every pass targets the same next state.  This is a learned fixed-point
-        # refinement, not another time step, so the temporal rollout remains in
-        # train_baselines.fine_tune_rollout and is not duplicated here.
         for _ in range(self.refinement_steps - 1):
             correction = self.corrector(state, output)
-            output = self.projection(output + self.refinement_alpha * correction)
+            output = output + self.refinement_alpha * correction
         return output

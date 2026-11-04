@@ -19,7 +19,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from data.pino_data_pipeline import PINONormalizer, get_rollout_loader, get_single_step_loader
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 from train.train_baselines import (
     evaluate_model_on_test,
     evaluate_rollout_horizons,

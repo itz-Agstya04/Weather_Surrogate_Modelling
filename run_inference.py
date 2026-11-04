@@ -8,6 +8,7 @@ import uuid
 import numpy as np
 import torch
 import xarray as xr
+from data.store import open_project_zarr
 
 from data.pino_data_pipeline import (
     CHANNEL_NAMES,
@@ -17,7 +18,7 @@ from data.pino_data_pipeline import (
     UPPER_AIR_VAR,
     load_full_split_tensor,
 )
-from train.proposed_model import ProposedModel
+from models.proposed_model import ProposedModel
 from train.train_baselines import CoordinateFNO2d, load_checkpoint
 
 
@@ -81,7 +82,7 @@ def load_initial_state(args):
         return state, None, None
 
     store = os.path.join(DATASET_DIR, "test_2021_2022.zarr")
-    ds = xr.open_zarr(store)
+    ds = open_project_zarr(store, consolidated=True)
     timestamp = np.datetime64(args.init_time)
     selected = ds.sel(time=timestamp).expand_dims(time=[timestamp])
     return load_full_split_tensor(selected).squeeze(0), ds, timestamp

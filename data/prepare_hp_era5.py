@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from dask.diagnostics import ProgressBar
+from data.store import open_project_zarr, stamp_store
 
 
 ERA5_ZARR_URL = (
@@ -123,7 +124,7 @@ def write_split_incrementally(
     store_exists = os.path.exists(out_path)
 
     if store_exists and resume:
-        existing = xr.open_zarr(out_path)
+        existing = open_project_zarr(out_path, consolidated=True)
         last_time = pd.Timestamp(existing.time.values[-1])
         existing.close()
         print(
@@ -264,6 +265,16 @@ def process_hp_era5(output_dir: str = "DATASET", resume: bool = True) -> None:
         out_path = os.path.join(output_dir, split_name)
         print(f"\nProcessing '{split_name}' from {start_time} to {end_time}...", flush=True)
         write_split_incrementally(ds_sub, out_path, start_time, end_time, resume=resume)
+        stamp_store(
+            out_path,
+            source=ERA5_ZARR_URL,
+            request_parameters={
+                "latitude": [33.5, 30.0], "longitude": [75.5, 79.5],
+                "levels_hpa": target_levels, "variables": target_vars,
+                "time_start": start_time, "time_end": end_time,
+            },
+            download_date=pd.Timestamp.utcnow().date().isoformat(),
+        )
         print(f"[OK] Finished: {out_path}", flush=True)
         created_paths[split_name] = out_path
 
@@ -272,7 +283,7 @@ def process_hp_era5(output_dir: str = "DATASET", resume: bool = True) -> None:
 
     for split_name, out_path in created_paths.items():
         print(f"\nValidating: {split_name}", flush=True)
-        ds_val = xr.open_zarr(out_path)
+        ds_val = open_project_zarr(out_path, consolidated=True)
 
         lat_vals = ds_val.latitude.values
         lon_vals = ds_val.longitude.values

@@ -15,6 +15,7 @@ import numpy as np
 import xarray as xr
 import torch
 from torch.utils.data import Dataset, DataLoader
+from data.store import open_project_zarr
 
 
 SURFACE_VARS = ['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind']
@@ -35,14 +36,18 @@ def compute_train_norm_stats(train_zarr_path: str, save_path: str = None) -> dic
     Never peeks at val or test stores.
     """
     print(f"\n--- Step 1: Computing Normalization Statistics from '{train_zarr_path}' ONLY ---", flush=True)
-    ds = xr.open_zarr(train_zarr_path)
+    ds = open_project_zarr(train_zarr_path)
     
     stats = {}
     
-    # 1. Surface variables
+    def mean_std(data_array):
+        values = data_array.astype("float64")
+        mean_value = float(values.mean().compute())
+        std_value = float(values.std().compute())
+        return mean_value, std_value
+
     for var in SURFACE_VARS:
-        mean_val = float(ds[var].mean())
-        std_val = float(ds[var].std())
+        mean_val, std_val = mean_std(ds[var])
         stats[var] = {'mean': mean_val, 'std': std_val}
         print(f"  {var:25s} -> Mean: {mean_val:10.4f}, Std: {std_val:10.4f}", flush=True)
         
@@ -50,10 +55,16 @@ def compute_train_norm_stats(train_zarr_path: str, save_path: str = None) -> dic
     stats[UPPER_AIR_VAR] = {}
     for lvl in TARGET_LEVELS:
         ds_lvl = ds[UPPER_AIR_VAR].sel(level=lvl)
-        mean_val = float(ds_lvl.mean())
-        std_val = float(ds_lvl.std())
+        mean_val, std_val = mean_std(ds_lvl)
         stats[UPPER_AIR_VAR][str(lvl)] = {'mean': mean_val, 'std': std_val}
         print(f"  geopotential_{lvl:<4d} (hPa) -> Mean: {mean_val:10.4f}, Std: {std_val:10.4f}", flush=True)
+
+    stats[UPPER_AIR_TEMPERATURE_VAR] = {}
+    for lvl in TARGET_LEVELS:
+        ds_lvl = ds[UPPER_AIR_TEMPERATURE_VAR].sel(level=lvl)
+        mean_val, std_val = mean_std(ds_lvl)
+        stats[UPPER_AIR_TEMPERATURE_VAR][str(lvl)] = {'mean': mean_val, 'std': std_val}
+        print(f"  temperature_{lvl:<4d} (hPa) -> Mean: {mean_val:10.4f}, Std: {std_val:10.4f}", flush=True)
         
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -152,7 +163,7 @@ class HPERA5SingleStepDataset(Dataset):
     """
     def __init__(self, store_path: str, normalizer: PINONormalizer = None, transform: bool = True):
         self.store_path = store_path
-        self.ds = xr.open_zarr(store_path)
+        self.ds = open_project_zarr(store_path)
         self.normalizer = normalizer
         self.transform = transform
         
@@ -180,7 +191,7 @@ class HPERA5RolloutDataset(Dataset):
     """
     def __init__(self, store_path: str, sequence_length: int = 4, normalizer: PINONormalizer = None, transform: bool = True):
         self.store_path = store_path
-        self.ds = xr.open_zarr(store_path)
+        self.ds = open_project_zarr(store_path)
         self.sequence_length = sequence_length
         self.normalizer = normalizer
         self.transform = transform
@@ -246,7 +257,7 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
         single_loader = get_single_step_loader(train_path, normalizer, batch_size=8, shuffle=False)
         inp_batch, tgt_batch = next(iter(single_loader))
         
-        expected_shape = (8, 8, 15, 17)  # (Batch=8, Channels=8, Lat=15, Lon=17)
+        expected_shape = (8, len(CHANNEL_NAMES), 15, 17)
         assert tuple(inp_batch.shape) == expected_shape, f"Input shape mismatch: {inp_batch.shape} vs {expected_shape}"
         assert tuple(tgt_batch.shape) == expected_shape, f"Target shape mismatch: {tgt_batch.shape} vs {expected_shape}"
         results['Check 2: Single-Step Loader Batch Shape (B, C, H, W)'] = f"PASS (Shape: {list(inp_batch.shape)})"
@@ -259,7 +270,8 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
         rollout_loader = get_rollout_loader(val_path, normalizer, sequence_length=seq_len, batch_size=4, shuffle=False)
         seq_batch = next(iter(rollout_loader))
         
-        expected_seq_shape = (4, seq_len, 8, 15, 17)
+        expected_seq_shape = (4, seq_len, len(CHANNEL_NAMES), 15, 17)
+
         assert tuple(seq_batch.shape) == expected_seq_shape, f"Rollout shape mismatch: {seq_batch.shape} vs {expected_seq_shape}"
         results['Check 3: Rollout Loader Batch Shape & Contiguity'] = f"PASS (Shape: {list(seq_batch.shape)})"
     except Exception as e:
@@ -267,7 +279,7 @@ def run_pipeline_validation(train_path: str, val_path: str, test_path: str, stat
         
     # --- Check 4: Denormalization Reconstruction Precision ---
     try:
-        ds_val = xr.open_zarr(train_path)
+        ds_val = open_project_zarr(train_path)
         raw_sample = load_full_split_tensor(ds_val)[0]
         t_raw = raw_sample
         
@@ -308,4 +320,3 @@ if __name__ == "__main__":
     
     # 2. Run Pipeline Validation
     run_pipeline_validation(train_zarr, val_zarr, test_zarr, stats_json)
-
